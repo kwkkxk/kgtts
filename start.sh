@@ -23,11 +23,14 @@ if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 || ! 
 fi
 
 echo "[2/5] Preparing Gateway virtualenv (/opt/venv-gateway)..."
+# Upgrade base image brotli so --system-site-packages venvs never inherit an older brotli
+# lacking the output_buffer_limit keyword argument used by newer httpx/huggingface_hub.
+python3 -m pip install --no-cache-dir -U "brotli>=1.2.1" || true
 if [ ! -d /opt/venv-gateway ]; then
-    python3 -m venv --system-site-packages /opt/venv-gateway
+    python3 -m venv /opt/venv-gateway
     /opt/venv-gateway/bin/pip install --no-cache-dir -U pip
     /opt/venv-gateway/bin/pip install --no-cache-dir \
-        fastapi "uvicorn[standard]" httpx ormsgpack pydantic huggingface_hub hf_transfer
+        fastapi "uvicorn[standard]" httpx ormsgpack pydantic huggingface_hub hf_transfer "brotli>=1.2.1"
 fi
 
 echo "[3/5] Installing Fish Speech S2-Pro runtime (/opt/venv-fish)..."
