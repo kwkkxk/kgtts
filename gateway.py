@@ -87,7 +87,7 @@ class SpeechRequest(BaseModel):
     seed: Optional[int] = None
     normalize: bool = True
     streaming: bool = False
-    use_memory_cache: str = "off"
+    use_memory_cache: str = "on"
 
 
 class VoiceDesignRequest(BaseModel):
@@ -180,8 +180,13 @@ class ModelManager:
         self.gpu_lock = asyncio.Lock()
         self.fish_proc: Optional[asyncio.subprocess.Process] = None
         self.fish_ready = False
+        self.compiling = False
+        self.compile_fallback = False
         self.last_error: str = ""
         self.respawn_task: Optional[asyncio.Task] = None
+
+    def _compile_enabled(self) -> bool:
+        return FISH_COMPILE and not self.compile_fallback
 
     def _fish_command(self) -> List[str]:
         codec_path = os.path.join(FISH_CKPT_DIR, "codec.pth")
@@ -204,7 +209,7 @@ class ModelManager:
         ]
         if FISH_HALF:
             cmd.append("--half")
-        if FISH_COMPILE:
+        if self._compile_enabled():
             cmd.append("--compile")
         return cmd
 
@@ -241,9 +246,45 @@ class ModelManager:
         # Give CUDA a brief moment to reclaim driver allocations.
         await asyncio.sleep(1.0)
 
+    async def _warmup_fish_compile(self) -> bool:
+        """Runs one tiny synthesis so torch.compile builds CUDA kernels during startup."""
+        self.compiling = True
+        t0 = time.monotonic()
+        log.info("Running Fish Speech torch.compile warmup (one-time)...")
+        packed = ormsgpack.packb({
+            "text": "Hello.",
+            "references": [],
+            "format": "wav",
+            "chunk_length": 150,
+            "max_new_tokens": 64,
+            "top_p": 0.7,
+            "repetition_penalty": 1.2,
+            "temperature": 0.7,
+            "streaming": False,
+            "use_memory_cache": "on",
+            "normalize": True,
+        })
+        try:
+            async with httpx.AsyncClient(timeout=240.0) as client:
+                resp = await client.post(
+                    f"{FISH_BASE_URL}/v1/tts",
+                    content=packed,
+                    headers={"Content-Type": "application/msgpack"},
+                )
+            if resp.status_code == 200 and self.fish_proc and self.fish_proc.returncode is None:
+                log.info("Fish Speech torch.compile warmup finished in %.1fs", time.monotonic() - t0)
+                return True
+            log.warning("Fish compile warmup failed (status=%s); restarting without --compile.", resp.status_code)
+        except Exception as exc:
+            log.warning("Fish compile warmup error (%s); restarting without --compile.", exc)
+        finally:
+            self.compiling = False
+        return False
+
     async def start_fish_and_wait(self, timeout_sec: int = 180) -> None:
-        if await self.probe_fish_health():
+        if await self.probe_fish_health() and not self.compiling:
             return
+        freshly_started = False
         if not self.fish_proc or self.fish_proc.returncode is not None:
             env = os.environ.copy()
             env["PYTHONPATH"] = f"{FISH_DIR}:{env.get('PYTHONPATH', '')}".rstrip(":")
@@ -254,12 +295,26 @@ class ModelManager:
                 cwd=FISH_DIR,
                 env=env,
             )
+            freshly_started = True
         deadline = time.monotonic() + timeout_sec
         while time.monotonic() < deadline:
             if self.fish_proc.returncode is not None:
+                if freshly_started and self._compile_enabled():
+                    log.warning("Fish exited with code %s under --compile; retrying without --compile.", self.fish_proc.returncode)
+                    self.compile_fallback = True
+                    self.fish_proc = None
+                    await self.start_fish_and_wait(timeout_sec=timeout_sec)
+                    return
                 self.last_error = f"Fish Speech exited unexpectedly with code {self.fish_proc.returncode}."
                 raise RuntimeError(self.last_error)
             if await self.probe_fish_health():
+                if freshly_started and self._compile_enabled():
+                    ok = await self._warmup_fish_compile()
+                    if not ok:
+                        self.compile_fallback = True
+                        await self.stop_fish()
+                        await self.start_fish_and_wait(timeout_sec=timeout_sec)
+                        return
                 self.last_error = ""
                 log.info("Fish Speech S2-Pro is ready on %s", FISH_BASE_URL)
                 return
@@ -373,10 +428,12 @@ app.add_middleware(
 @app.get("/health")
 @app.get("/v1/health")
 async def health() -> Response:
-    fish_ok = await manager.probe_fish_health()
+    fish_ok = (not manager.compiling) and await manager.probe_fish_health()
     payload = {
-        "status": "ok" if fish_ok else "loading",
+        "status": "ok" if fish_ok else ("compiling" if manager.compiling else "loading"),
         "fish_ready": fish_ok,
+        "compiling": manager.compiling,
+        "compile_enabled": manager._compile_enabled(),
         "models": [FISH_MODEL_ID, QWEN_MODEL_ID],
         "free_vram_mib": query_free_vram_mib(),
         **({"error": manager.last_error} if manager.last_error else {}),
@@ -431,17 +488,21 @@ def build_fish_payload(req: SpeechRequest, fish_format: str) -> dict[str, Any]:
         if candidate and candidate.lower() not in {"default", "alloy", "none"}:
             ref_id = candidate
 
+    # Fish Speech /v1/tts validates temperature/top_p in [0.1, 1.0] and only allows
+    # streaming=True when format == "wav".
+    effective_streaming = bool(req.streaming) and fish_format == "wav"
+
     payload: dict[str, Any] = {
         "text": text,
         "references": refs,
         "format": fish_format,
         "chunk_length": max(100, min(300, int(req.chunk_length))),
         "max_new_tokens": max(128, min(4096, int(req.max_new_tokens))),
-        "top_p": max(0.05, min(1.0, float(req.top_p))),
+        "top_p": max(0.1, min(1.0, float(req.top_p))),
         "repetition_penalty": max(0.9, min(2.0, float(req.repetition_penalty))),
-        "temperature": max(0.05, min(1.5, float(req.temperature))),
-        "streaming": bool(req.streaming),
-        "use_memory_cache": "on" if str(req.use_memory_cache).lower() == "on" else "off",
+        "temperature": max(0.1, min(1.0, float(req.temperature))),
+        "streaming": effective_streaming,
+        "use_memory_cache": "off" if str(req.use_memory_cache).lower() == "off" else "on",
         "normalize": bool(req.normalize),
     }
     if ref_id:
@@ -481,9 +542,11 @@ async def synthesize_speech(req: SpeechRequest, request: Request) -> Response:
                 await upstream.aclose()
                 await client.aclose()
                 manager.gpu_lock.release()
+                detail = body.decode(errors="ignore")[:400] or "Fish Speech streaming failed."
+                log.warning("Fish /v1/tts stream error (%s): %s", upstream.status_code, detail)
                 raise HTTPException(
                     status_code=upstream.status_code,
-                    detail=body.decode(errors="ignore")[:400],
+                    detail=detail,
                 )
         except HTTPException:
             raise
@@ -507,6 +570,7 @@ async def synthesize_speech(req: SpeechRequest, request: Request) -> Response:
 
         return StreamingResponse(stream_audio(), media_type=MIME_TYPES[requested_fmt])
 
+    t0 = time.monotonic()
     async with manager.gpu_lock:
         try:
             await manager.start_fish_and_wait()
@@ -520,14 +584,23 @@ async def synthesize_speech(req: SpeechRequest, request: Request) -> Response:
                 headers={"Content-Type": "application/msgpack"},
             )
             if upstream.status_code != 200:
+                detail = upstream.text[:400] or "Fish Speech synthesis failed."
+                log.warning("Fish /v1/tts error (%s): %s", upstream.status_code, detail)
                 raise HTTPException(
                     status_code=upstream.status_code,
-                    detail=upstream.text[:400] or "Fish Speech synthesis failed.",
+                    detail=detail,
                 )
             audio = upstream.content
 
     if requested_fmt == "opus":
         audio = await transcode_audio(audio, "wav", "opus")
+    log.info(
+        "Fish speech generated in %.2fs (fmt=%s, chars=%d, bytes=%d)",
+        time.monotonic() - t0,
+        requested_fmt,
+        len(payload["text"]),
+        len(audio),
+    )
     return Response(content=audio, media_type=MIME_TYPES[requested_fmt])
 
 
